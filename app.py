@@ -1,10 +1,12 @@
-# app.py
+# app.py — background-thread sender (free-plan friendly)
 import os
 import csv
 import json
 import uuid
+import time
+import threading
 from datetime import datetime
-from flask import Flask, request, jsonify, render_template, send_from_directory, abort
+from flask import Flask, request, jsonify, render_template, send_from_directory
 from twilio.rest import Client
 import phonenumbers
 from threading import Lock
@@ -19,13 +21,12 @@ WALLET_PATH = os.path.join(DATA_DIR, 'wallet.json')
 JOBS_PATH = os.path.join(DATA_DIR, 'jobs.json')
 RECIPS_PATH = os.path.join(DATA_DIR, 'recipients.json')
 
-# ensure simple data files exist (wallet uses mills: 1 mill = $0.001)
 def ensure_file(path, default):
     if not os.path.exists(path):
         with open(path, 'w', encoding='utf8') as f:
             json.dump(default, f, indent=2)
 
-# Example: balance_mills: 100000 => $100.000
+# initialize data files (wallet uses mills: 1 mill = $0.001)
 ensure_file(WALLET_PATH, {"balance_mills": 100000})
 ensure_file(JOBS_PATH, [])
 ensure_file(RECIPS_PATH, [])
@@ -51,16 +52,15 @@ tw_client = None
 if TW_SID and TW_TOKEN:
     tw_client = Client(TW_SID, TW_TOKEN)
 
-# Admin token for simple protection
 ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', '')
 
-# --- constants for your new requirements ---
-# Price per SMS = $0.023 => 23 mills (1 mill = $0.001)
-PRICE_PER_SMS_MILLS = 23
-# Only allow Canada numbers
+# constants
+PRICE_PER_SMS_MILLS = 23   # $0.023
 ALLOWED_REGION = 'CA'
+SEND_DELAY_MS = int(os.getenv('SEND_DELAY_MS', '250'))
+MAX_IMMEDIATE_RETRIES = 3  # per-recipient immediate retry attempts for transient errors
 
-# --- helpers: segments & phone normalization ---
+# helpers
 def is_gsm7(text: str) -> bool:
     for ch in text or '':
         if ord(ch) > 127:
@@ -80,9 +80,6 @@ def segments_for_text(text: str) -> int:
         return (l + 66) // 67
 
 def normalize_phone_and_check_canada(raw: str, default_region: str = 'CA'):
-    """
-    Returns E.164 phone if valid and in Canada; otherwise returns (None, error_message)
-    """
     if not raw:
         return None, 'empty phone'
     raw = raw.strip()
@@ -95,31 +92,146 @@ def normalize_phone_and_check_canada(raw: str, default_region: str = 'CA'):
             return None, f'not a Canadian number (region={region})'
         return phonenumbers.format_number(pn, phonenumbers.PhoneNumberFormat.E164), None
     except Exception:
-        # fallback: simple check for +1 ... but we require proper Canada validation, so reject
         return None, 'could not parse phone number'
 
 def mills_to_usd_string(mills: int) -> str:
-    # mills -> dollars with 3 decimal places
     dollars = mills / 1000.0
     return f"${dollars:,.3f}"
 
-# --- routes ---
+# -----------------------
+# Background job processor
+# -----------------------
+def process_job(job_id):
+    """
+    Runs in a background thread.
+    Picks queued recipients for the job and sends them sequentially (throttled).
+    Updates recipient statuses and job record, and refunds unused mills at end.
+    """
+    print(f"[worker-thread] Starting job {job_id}")
+    sent_segments = 0
+    failed_segments = 0
+
+    while True:
+        # load recipients for this job with status queued or sending (resume semantics)
+        with fs_lock:
+            recips = read_json(RECIPS_PATH)
+            job_recs = [r for r in recips if r.get('jobId') == job_id and r.get('status') in ('queued', 'sending')]
+        if not job_recs:
+            break  # nothing left to send
+
+        # pick one recipient (FIFO)
+        rec = job_recs[0]
+        rec_id = rec['id']
+        phone = rec['phone']
+        msg_text = rec['message']
+        segs = rec.get('segments', 1)
+
+        # mark as sending and increment attempts
+        with fs_lock:
+            recips = read_json(RECIPS_PATH)
+            target = next((x for x in recips if x['id'] == rec_id), None)
+            if not target:
+                # already processed
+                continue
+            target['status'] = 'sending'
+            target['attempts'] = target.get('attempts', 0) + 1
+            target['lastAttemptAt'] = datetime.utcnow().isoformat() + 'Z'
+            write_json_atomic(RECIPS_PATH, recips)
+
+        # try send (with a few immediate retries for transient errors)
+        success = False
+        last_err = None
+        for attempt in range(MAX_IMMEDIATE_RETRIES):
+            try:
+                if not tw_client:
+                    raise RuntimeError('Twilio not configured')
+                msg = tw_client.messages.create(
+                    body=msg_text,
+                    to=phone,
+                    from_=TW_FROM,
+                    status_callback=(PUBLIC_WEBHOOK.rstrip('/') + '/api/twilio/status') if PUBLIC_WEBHOOK else None
+                )
+                # success
+                success = True
+                tw_sid = getattr(msg, 'sid', None)
+                with fs_lock:
+                    recips = read_json(RECIPS_PATH)
+                    target = next((x for x in recips if x['id'] == rec_id), None)
+                    if target:
+                        target['twilioSid'] = tw_sid
+                        target['status'] = 'sent'
+                        target['lastSend'] = datetime.utcnow().isoformat() + 'Z'
+                        write_json_atomic(RECIPS_PATH, recips)
+                sent_segments += segs
+                break
+            except Exception as e:
+                last_err = str(e)
+                # transient wait small backoff
+                time.sleep(0.5 + attempt * 0.5)
+                continue
+
+        if not success:
+            # mark failed (no more immediate retries)
+            with fs_lock:
+                recips = read_json(RECIPS_PATH)
+                target = next((x for x in recips if x['id'] == rec_id), None)
+                if target:
+                    target['lastError'] = last_err
+                    target['status'] = 'failed'
+                    write_json_atomic(RECIPS_PATH, recips)
+            failed_segments += segs
+
+        # throttle between sends
+        time.sleep(SEND_DELAY_MS / 1000.0)
+
+    # job finished: compute refund and update job record
+    with fs_lock:
+        jobs = read_json(JOBS_PATH)
+        job = next((j for j in jobs if j.get('id') == job_id), None)
+        if job:
+            reserved_mills = job.get('totalCost_mills', 0)
+            actual_cost_mills = sent_segments * PRICE_PER_SMS_MILLS
+            refund_mills = max(0, reserved_mills - actual_cost_mills)
+            # refund
+            if refund_mills > 0:
+                wallet = read_json(WALLET_PATH)
+                wallet['balance_mills'] = wallet.get('balance_mills', 0) + refund_mills
+                write_json_atomic(WALLET_PATH, wallet)
+            job['status'] = 'completed'
+            job['sent_segments'] = sent_segments
+            job['failed_segments'] = failed_segments
+            job['actual_cost_mills'] = actual_cost_mills
+            job['refund_mills'] = refund_mills
+            job['completedAt'] = datetime.utcnow().isoformat() + 'Z'
+            write_json_atomic(JOBS_PATH, jobs)
+    print(f"[worker-thread] Completed job {job_id}: sent={sent_segments} failed={failed_segments}")
+
+def start_background_worker_for(job_id):
+    t = threading.Thread(target=process_job, args=(job_id,), daemon=True)
+    t.start()
+    return t
+
+# On startup: resume any queued recipients (safety/resume)
+def resume_pending_jobs_on_startup():
+    with fs_lock:
+        recips = read_json(RECIPS_PATH)
+        pending_job_ids = sorted({r['jobId'] for r in recips if r.get('status') in ('queued', 'sending')})
+    for jid in pending_job_ids:
+        print(f"[startup] Resuming pending job {jid}")
+        start_background_worker_for(jid)
+
+# schedule resume once when app starts
+resume_pending_jobs_on_startup()
+
+# -----------------------
+# HTTP endpoints
+# -----------------------
 @app.route('/')
 def index():
     return render_template('index.html')
 
 @app.route('/api/estimate', methods=['POST'])
 def api_estimate():
-    """
-    POST JSON:
-    {
-      "csv": "<csv text>",
-      "template": "<template with {{name}}>",
-      "defaultCountry": "CA",
-      "send": false|true
-    }
-    Note: price per sms is fixed server-side to $0.023 (23 mills).
-    """
     payload = request.get_json(force=True)
     csv_text = payload.get('csv') or ''
     template = payload.get('template') or ''
@@ -129,7 +241,6 @@ def api_estimate():
     if not csv_text:
         return jsonify(error='CSV missing'), 400
 
-    # parse CSV robustly
     try:
         reader = csv.DictReader(csv_text.splitlines())
         rows = [r for r in reader if any((v or '').strip() for v in r.values())]
@@ -161,10 +272,11 @@ def api_estimate():
     total_cost_mills = total_segments * PRICE_PER_SMS_MILLS
 
     if not do_send:
-        return jsonify(rows=parsed, totalSegments=total_segments, totalCost_mills=total_cost_mills,
-                       totalCost_usd=mills_to_usd_string(total_cost_mills), rejected=rejected)
+        return jsonify(rows=parsed, totalSegments=total_segments,
+                       totalCost_mills=total_cost_mills, totalCost_usd=mills_to_usd_string(total_cost_mills),
+                       rejected=rejected)
 
-    # send == true -> reserve wallet, create job & recipients
+    # reserve wallet and create job & recipients, then start background processing
     with fs_lock:
         wallet = read_json(WALLET_PATH)
         if wallet.get('balance_mills', 0) < total_cost_mills:
@@ -204,9 +316,11 @@ def api_estimate():
             })
         write_json_atomic(RECIPS_PATH, recips)
 
-    return jsonify(ok=True, jobId=job_id, rows=parsed, totalSegments=total_segments,
-                   totalCost_mills=total_cost_mills, totalCost_usd=mills_to_usd_string(total_cost_mills),
-                   rejected=rejected)
+    # start background worker thread and return immediately
+    start_background_worker_for(job_id)
+
+    return jsonify(ok=True, jobId=job_id, totalCost_mills=total_cost_mills,
+                   totalCost_usd=mills_to_usd_string(total_cost_mills), rejected=rejected)
 
 @app.route('/api/wallet', methods=['GET'])
 def api_wallet():
@@ -214,7 +328,6 @@ def api_wallet():
     balance_mills = wallet.get('balance_mills', 0)
     return jsonify(balance_mills=balance_mills, balance_usd=mills_to_usd_string(balance_mills))
 
-# admin topup: protected by ADMIN_TOKEN header (amount in mills)
 @app.route('/api/admin/topup', methods=['POST'])
 def api_topup():
     token = request.headers.get('X-ADMIN-TOKEN', '')
@@ -230,7 +343,6 @@ def api_topup():
         write_json_atomic(WALLET_PATH, wallet)
     return jsonify(ok=True, balance_mills=wallet['balance_mills'], balance_usd=mills_to_usd_string(wallet['balance_mills']))
 
-# Twilio delivery webhook (Twilio POSTS form data)
 @app.route('/api/twilio/status', methods=['POST'])
 def api_twilio_status():
     sid = request.form.get('MessageSid') or request.form.get('SmsSid')
@@ -265,7 +377,6 @@ def api_twilio_status():
             write_json_atomic(RECIPS_PATH, recips)
     return '', 200
 
-# job status endpoint
 @app.route('/api/job/<job_id>', methods=['GET'])
 def api_job(job_id):
     jobs = read_json(JOBS_PATH)
@@ -276,12 +387,10 @@ def api_job(job_id):
     job_recs = [r for r in recips if r.get('jobId') == job_id]
     return jsonify(job=job, recipients=job_recs)
 
-# simple static files if needed
 @app.route('/static/<path:filename>')
 def static_files(filename):
     return send_from_directory('static', filename)
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', '5000'))
-    # debug True is convenient for dev; disable for production
     app.run(host='0.0.0.0', port=port, debug=True)
