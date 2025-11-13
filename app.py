@@ -19,13 +19,14 @@ WALLET_PATH = os.path.join(DATA_DIR, 'wallet.json')
 JOBS_PATH = os.path.join(DATA_DIR, 'jobs.json')
 RECIPS_PATH = os.path.join(DATA_DIR, 'recipients.json')
 
-# ensure simple data files exist
+# ensure simple data files exist (wallet uses mills: 1 mill = $0.001)
 def ensure_file(path, default):
     if not os.path.exists(path):
         with open(path, 'w', encoding='utf8') as f:
             json.dump(default, f, indent=2)
 
-ensure_file(WALLET_PATH, {"balance": 100000})
+# Example: balance_mills: 100000 => $100.000
+ensure_file(WALLET_PATH, {"balance_mills": 100000})
 ensure_file(JOBS_PATH, [])
 ensure_file(RECIPS_PATH, [])
 
@@ -53,6 +54,12 @@ if TW_SID and TW_TOKEN:
 # Admin token for simple protection
 ADMIN_TOKEN = os.getenv('ADMIN_TOKEN', '')
 
+# --- constants for your new requirements ---
+# Price per SMS = $0.023 => 23 mills (1 mill = $0.001)
+PRICE_PER_SMS_MILLS = 23
+# Only allow Canada numbers
+ALLOWED_REGION = 'CA'
+
 # --- helpers: segments & phone normalization ---
 def is_gsm7(text: str) -> bool:
     for ch in text or '':
@@ -72,24 +79,29 @@ def segments_for_text(text: str) -> int:
             return 1
         return (l + 66) // 67
 
-def normalize_phone(raw: str, default_region: str = 'IN'):
+def normalize_phone_and_check_canada(raw: str, default_region: str = 'CA'):
+    """
+    Returns E.164 phone if valid and in Canada; otherwise returns (None, error_message)
+    """
     if not raw:
-        return None
+        return None, 'empty phone'
     raw = raw.strip()
     try:
         pn = phonenumbers.parse(raw, default_region)
-        if phonenumbers.is_valid_number(pn):
-            return phonenumbers.format_number(pn, phonenumbers.PhoneNumberFormat.E164)
+        if not phonenumbers.is_valid_number(pn):
+            return None, 'invalid phone number'
+        region = phonenumbers.region_code_for_number(pn)
+        if region != ALLOWED_REGION:
+            return None, f'not a Canadian number (region={region})'
+        return phonenumbers.format_number(pn, phonenumbers.PhoneNumberFormat.E164), None
     except Exception:
-        pass
-    # fallback: strip non-digits and add leading + if present
-    digits = ''.join(ch for ch in raw if ch.isdigit())
-    if raw.startswith('+') and digits:
-        return '+' + digits
-    # no plus sign — return digits (may be incomplete)
-    if len(digits) >= 8:
-        return digits
-    return None
+        # fallback: simple check for +1 ... but we require proper Canada validation, so reject
+        return None, 'could not parse phone number'
+
+def mills_to_usd_string(mills: int) -> str:
+    # mills -> dollars with 3 decimal places
+    dollars = mills / 1000.0
+    return f"${dollars:,.3f}"
 
 # --- routes ---
 @app.route('/')
@@ -103,16 +115,15 @@ def api_estimate():
     {
       "csv": "<csv text>",
       "template": "<template with {{name}}>",
-      "pricePerSegment": 50,
-      "defaultCountry": "IN",
+      "defaultCountry": "CA",
       "send": false|true
     }
+    Note: price per sms is fixed server-side to $0.023 (23 mills).
     """
     payload = request.get_json(force=True)
     csv_text = payload.get('csv') or ''
     template = payload.get('template') or ''
-    price_per_segment = int(payload.get('pricePerSegment') or 0)
-    default_country = payload.get('defaultCountry') or 'IN'
+    default_country = payload.get('defaultCountry') or 'CA'
     do_send = payload.get('send') is True
 
     if not csv_text:
@@ -127,12 +138,15 @@ def api_estimate():
 
     parsed = []
     total_segments = 0
+    rejected = []
     for r in rows:
         raw_phone = (r.get('phone') or r.get('phone_number') or r.get('mobile') or r.get('msisdn') or '').strip()
         if not raw_phone:
+            rejected.append({'row': r, 'reason': 'phone missing'})
             continue
-        phone = normalize_phone(raw_phone, default_country)
-        if not phone:
+        phone, err = normalize_phone_and_check_canada(raw_phone, default_country)
+        if err:
+            rejected.append({'row': r, 'reason': err})
             continue
         if (r.get('message') or '').strip():
             message = r.get('message').strip()
@@ -144,17 +158,19 @@ def api_estimate():
         total_segments += seg
         parsed.append({'phone': phone, 'message': message, 'segments': seg, 'original': r})
 
-    total_cost = total_segments * price_per_segment
+    total_cost_mills = total_segments * PRICE_PER_SMS_MILLS
 
     if not do_send:
-        return jsonify(rows=parsed, totalSegments=total_segments, totalCost=total_cost)
+        return jsonify(rows=parsed, totalSegments=total_segments, totalCost_mills=total_cost_mills,
+                       totalCost_usd=mills_to_usd_string(total_cost_mills), rejected=rejected)
 
     # send == true -> reserve wallet, create job & recipients
     with fs_lock:
         wallet = read_json(WALLET_PATH)
-        if wallet.get('balance', 0) < total_cost:
-            return jsonify(error='Insufficient wallet balance'), 402
-        wallet['balance'] = wallet.get('balance', 0) - total_cost
+        if wallet.get('balance_mills', 0) < total_cost_mills:
+            return jsonify(error='Insufficient wallet balance', required_mills=total_cost_mills,
+                           required_usd=mills_to_usd_string(total_cost_mills)), 402
+        wallet['balance_mills'] = wallet.get('balance_mills', 0) - total_cost_mills
         write_json_atomic(WALLET_PATH, wallet)
 
         jobs = read_json(JOBS_PATH)
@@ -163,8 +179,10 @@ def api_estimate():
             "id": job_id,
             "totalRecipients": len(parsed),
             "totalSegments": total_segments,
-            "totalCost": total_cost,
-            "pricePerSegment": price_per_segment,
+            "totalCost_mills": total_cost_mills,
+            "totalCost_usd": mills_to_usd_string(total_cost_mills),
+            "pricePerSegment_mills": PRICE_PER_SMS_MILLS,
+            "pricePerSegment_usd": mills_to_usd_string(PRICE_PER_SMS_MILLS),
             "status": "queued",
             "createdAt": datetime.utcnow().isoformat() + 'Z'
         }
@@ -186,28 +204,31 @@ def api_estimate():
             })
         write_json_atomic(RECIPS_PATH, recips)
 
-    return jsonify(ok=True, jobId=job_id, rows=parsed, totalSegments=total_segments, totalCost=total_cost)
+    return jsonify(ok=True, jobId=job_id, rows=parsed, totalSegments=total_segments,
+                   totalCost_mills=total_cost_mills, totalCost_usd=mills_to_usd_string(total_cost_mills),
+                   rejected=rejected)
 
 @app.route('/api/wallet', methods=['GET'])
 def api_wallet():
     wallet = read_json(WALLET_PATH)
-    return jsonify(wallet)
+    balance_mills = wallet.get('balance_mills', 0)
+    return jsonify(balance_mills=balance_mills, balance_usd=mills_to_usd_string(balance_mills))
 
-# admin topup: protected by ADMIN_TOKEN header
+# admin topup: protected by ADMIN_TOKEN header (amount in mills)
 @app.route('/api/admin/topup', methods=['POST'])
 def api_topup():
     token = request.headers.get('X-ADMIN-TOKEN', '')
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
         return jsonify(error='unauthorized'), 401
     body = request.get_json(force=True)
-    amount = int(body.get('amount') or 0)
-    if amount <= 0:
-        return jsonify(error='amount required'), 400
+    amount_mills = int(body.get('amount_mills') or 0)
+    if amount_mills <= 0:
+        return jsonify(error='amount_mills required (integer)'), 400
     with fs_lock:
         wallet = read_json(WALLET_PATH)
-        wallet['balance'] = wallet.get('balance', 0) + amount
+        wallet['balance_mills'] = wallet.get('balance_mills', 0) + amount_mills
         write_json_atomic(WALLET_PATH, wallet)
-    return jsonify(ok=True, balance=wallet['balance'])
+    return jsonify(ok=True, balance_mills=wallet['balance_mills'], balance_usd=mills_to_usd_string(wallet['balance_mills']))
 
 # Twilio delivery webhook (Twilio POSTS form data)
 @app.route('/api/twilio/status', methods=['POST'])
@@ -264,4 +285,3 @@ if __name__ == '__main__':
     port = int(os.getenv('PORT', '5000'))
     # debug True is convenient for dev; disable for production
     app.run(host='0.0.0.0', port=port, debug=True)
-
