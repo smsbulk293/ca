@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: ca-bulk-sms-web
+    env: python
+    repo: https://github.com/smsbulk293/ca
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT
+    envVars:
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM
+        sync: false
+      - key: PUBLIC_WEBHOOK_URL
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: SEND_CONCURRENCY
+        sync: false
+      - key: SEND_DELAY_MS
+        sync: false
+
+  - type: worker
+    name: ca-bulk-sms-worker
+    env: python
+    repo: https://github.com/smsbulk293/ca
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python worker.py
+    envVars:
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_FROM
+        sync: false
+      - key: PUBLIC_WEBHOOK_URL
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: SEND_CONCURRENCY
+        sync: false
+      - key: SEND_DELAY_MS
+        sync: false
