@@ -1,6 +1,5 @@
 Flask==2.3.2
-twilio==8.3.1
+twilio==8.13.0
 phonenumbers==8.13.26
 python-dotenv==1.0.0
 gunicorn==21.2.0
-
