@@ -80,11 +80,33 @@ def segments_for_text(text: str) -> int:
         return (l + 66) // 67
 
 def normalize_phone_and_check_canada(raw: str, default_region: str = 'CA'):
+    """
+    Normalize input (auto-add + if missing) and ensure it's a valid Canadian E.164 number.
+    Accepts numbers like:
+      4165551234 -> +14165551234
+      1416551234 -> +11415551234 (if it's 11 digits starting with country code 1)
+      +14165551234 -> +14165551234
+    Returns (e164_phone, None) on success, or (None, error_message) on failure.
+    """
     if not raw:
         return None, 'empty phone'
-    raw = raw.strip()
+    raw = str(raw).strip()
+
+    # Remove common separators and keep digits and leading '+'
+    cleaned = ''.join(ch for ch in raw if ch.isdigit() or ch == '+')
+
+    # Auto-add plus/country code rules:
+    if not cleaned.startswith('+'):
+        # If 10 digits -> assume Canada (+1)
+        if len(cleaned) == 10:
+            cleaned = '+1' + cleaned
+        # If 11 digits and starts with 1 -> prefix +
+        elif len(cleaned) == 11 and cleaned.startswith('1'):
+            cleaned = '+' + cleaned
+        # else leave as-is (phonenumbers may still parse it)
+
     try:
-        pn = phonenumbers.parse(raw, default_region)
+        pn = phonenumbers.parse(cleaned, None)
         if not phonenumbers.is_valid_number(pn):
             return None, 'invalid phone number'
         region = phonenumbers.region_code_for_number(pn)
@@ -93,6 +115,7 @@ def normalize_phone_and_check_canada(raw: str, default_region: str = 'CA'):
         return phonenumbers.format_number(pn, phonenumbers.PhoneNumberFormat.E164), None
     except Exception:
         return None, 'could not parse phone number'
+
 
 def mills_to_usd_string(mills: int) -> str:
     dollars = mills / 1000.0
