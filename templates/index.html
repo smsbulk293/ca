@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Simple Bulk SMS (Python)</title>
+  <title>Simple Bulk SMS (Canada only)</title>
   <style>
     body{font-family:system-ui, Arial; max-width:900px;margin:24px auto;padding:0 12px}
     textarea,input,select{width:100%;padding:8px;margin:6px 0;border:1px solid #ddd;border-radius:6px}
@@ -11,17 +11,15 @@
     .col{flex:1}
     table{width:100%;border-collapse:collapse;margin-top:8px}
     th,td{border:1px solid #eee;padding:6px;text-align:left}
-    .small{font-size:13px;color:#666}
+    .small{font-size:13px;color:#666'}
+    .muted{color:#666;font-size:13px}
   </style>
 </head>
 <body>
-  <h1>Bulk SMS — Simple (Python)</h1>
-  <p class="small">Upload CSV (columns: phone,message OR phone,name & enter template). Phone should include country code or use default country below.</p>
+  <h1>Bulk SMS — Canada Only</h1>
+  <p class="muted">Price per SMS: <strong>$0.023 USD</strong> (charged automatically). Wallet balance is shown in USD. Only Canadian numbers are accepted.</p>
 
-  <label>Default country (for parsing numbers) — e.g. IN, US</label>
-  <input id="defaultCountry" value="IN">
-
-  <label>Upload CSV file</label>
+  <label>Upload CSV file (columns: phone,message OR phone,name)</label>
   <input type="file" id="csvFile" accept=".csv">
 
   <label>Or paste CSV content</label>
@@ -29,9 +27,6 @@
 
   <label>Or enter a template (use {{name}}). If left blank, per-row message column must exist.</label>
   <textarea id="template" rows="3" placeholder="Hi {{name}}, your code is 1234"></textarea>
-
-  <label>Price per SMS segment (in paise/cents) — e.g. 50 = ₹0.50</label>
-  <input id="pricePerSegment" value="50">
 
   <div style="display:flex;gap:12px;margin-top:8px">
     <button id="estimateBtn">Estimate & Preview</button>
@@ -45,28 +40,34 @@
   <div id="walletArea">
     <button id="refreshWallet">Refresh</button>
     <div id="walletInfo"></div>
-    <div class="small">To top up quickly: call admin endpoint with header X-ADMIN-TOKEN or update data/wallet.json for local testing.</div>
+    <div class="small">To top up: call admin endpoint with header <code>X-ADMIN-TOKEN</code>. Amount must be in mills (1 mill = $0.001). Example: top-up 100000 mills = $100.000</div>
   </div>
 
   <script>
+    const PRICE_PER_SMS_USD = 0.023; // display only
+    const PRICE_PER_SMS_MILLS = 23; // server-side uses mills
+
     async function toText(file){
       if(!file) return '';
       return await file.text();
     }
 
-    async function parseCsvServer(csvText, template, pricePerSegment, defaultCountry, send){
+    async function parseCsvServer(csvText, template, defaultCountry, send){
       const res = await fetch('/api/estimate', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ csv: csvText, template, pricePerSegment, defaultCountry, send })
+        body: JSON.stringify({ csv: csvText, template, defaultCountry, send })
       });
       return await res.json();
     }
 
-    function renderPreview(rows, totals){
+    function renderPreview(rows, totals, rejected){
       const container = document.getElementById('preview');
       if(!rows || rows.length===0){ container.innerHTML = '<div class="small">No rows parsed yet.</div>'; return; }
-      let html = `<div class="small">Rows parsed: ${rows.length} — Estimated segments: ${totals.segments} — Estimated cost: ${totals.cost} (in smallest currency unit)</div>`;
+      let html = `<div class="muted">Rows parsed: ${rows.length} — Estimated segments: ${totals.segments} — Estimated cost: ${totals.cost_usd} USD</div>`;
+      if(rejected && rejected.length>0){
+        html += `<div style="color:#b91c1c;margin-top:8px"><strong>Rejected rows:</strong> ${rejected.length}. Check CSV and ensure numbers are Canadian (+1 country code or valid Canada format).</div>`;
+      }
       html += '<table><thead><tr><th>#</th><th>phone</th><th>message</th><th>segments</th></tr></thead><tbody>';
       for(let i=0;i<Math.min(rows.length,20);i++){
         html += `<tr><td>${i+1}</td><td>${rows[i].phone||''}</td><td>${rows[i].message||''}</td><td>${rows[i].segments||''}</td></tr>`;
@@ -82,11 +83,11 @@
       if(file && !text) text = await toText(file);
       if(!text){ alert('Provide CSV'); return; }
       const template = document.getElementById('template').value;
-      const pricePerSegment = parseInt(document.getElementById('pricePerSegment').value||'0',10);
-      const defaultCountry = document.getElementById('defaultCountry').value||'IN';
-      const j = await parseCsvServer(text, template, pricePerSegment, defaultCountry, false);
+      const defaultCountry = 'CA';
+      const j = await parseCsvServer(text, template, defaultCountry, false);
       if(j.error) return alert(j.error);
-      renderPreview(j.rows, {segments:j.totalSegments, cost:j.totalCost});
+      const totals = { segments: j.totalSegments, cost_usd: j.totalCost_usd };
+      renderPreview(j.rows, totals, j.rejected || []);
     };
 
     document.getElementById('sendBtn').onclick = async () => {
@@ -96,22 +97,21 @@
       if(file && !text) text = await toText(file);
       if(!text){ alert('Provide CSV'); return; }
       const template = document.getElementById('template').value;
-      const pricePerSegment = parseInt(document.getElementById('pricePerSegment').value||'0',10);
-      const defaultCountry = document.getElementById('defaultCountry').value||'IN';
-      const j = await parseCsvServer(text, template, pricePerSegment, defaultCountry, true);
+      const defaultCountry = 'CA';
+      const j = await parseCsvServer(text, template, defaultCountry, true);
       if(j.error) return alert(j.error);
-      renderPreview(j.rows, {segments:j.totalSegments, cost:j.totalCost});
-      alert('Job queued! Job id: ' + j.jobId);
+      const totals = { segments: j.totalSegments, cost_usd: j.totalCost_usd };
+      renderPreview(j.rows, totals, j.rejected || []);
+      alert('Job queued! Job id: ' + j.jobId + '\nEstimated cost: ' + j.totalCost_usd + ' USD');
     };
 
     async function refreshWallet(){
       const r = await fetch('/api/wallet');
       const j = await r.json();
-      document.getElementById('walletInfo').innerHTML = `<div>Balance: ${j.balance} (smallest currency unit)</div>`;
+      document.getElementById('walletInfo').innerHTML = `<div>Balance: <strong>${j.balance_usd} USD</strong> (${j.balance_mills} mills)</div>`;
     }
     document.getElementById('refreshWallet').onclick = refreshWallet;
     refreshWallet();
   </script>
 </body>
 </html>
-
