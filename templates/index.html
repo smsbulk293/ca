@@ -1,117 +1,169 @@
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>Simple Bulk SMS (Canada only)</title>
+  <meta charset="utf-8" />
+  <title>Bulk SMS - Simple</title>
   <style>
-    body{font-family:system-ui, Arial; max-width:900px;margin:24px auto;padding:0 12px}
-    textarea,input,select{width:100%;padding:8px;margin:6px 0;border:1px solid #ddd;border-radius:6px}
-    button{padding:10px 16px;border-radius:8px;border:0;background:#2563eb;color:white;cursor:pointer}
-    .row{display:flex;gap:12px}
-    .col{flex:1}
-    table{width:100%;border-collapse:collapse;margin-top:8px}
-    th,td{border:1px solid #eee;padding:6px;text-align:left}
-    .small{font-size:13px;color:#666'}
-    .muted{color:#666;font-size:13px}
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; }
+    textarea, input[type=file], input[type=text] { width:100%; box-sizing:border-box; padding:8px; margin:6px 0; }
+    button { padding:10px 14px; margin:6px 4px; }
+    #analytics { border:1px solid #ddd; padding:12px; border-radius:6px; margin-top:12px; display:none; }
+    .bar { height:18px; background:#eee; border-radius:9px; overflow:hidden; margin-top:8px; }
+    .bar-inner { height:100%; background:#4caf50; width:0%; transition: width 0.5s ease; }
+    .fail-inner { height:100%; background:#f44336; width:0%; transition: width 0.5s ease; position:relative; left:0; }
+    .row { display:flex; gap:12px; align-items:center; margin-top:6px; }
+    .muted { color:#666; font-size:13px; }
   </style>
 </head>
 <body>
-  <h1>Bulk SMS — Canada Only</h1>
-  <p class="muted">Price per SMS: <strong>$0.023 USD</strong> (charged automatically). Wallet balance is shown in USD. Only Canadian numbers are accepted.</p>
+  <h1>Bulk SMS — Simple</h1>
 
-  <label>Upload CSV file (columns: phone,message OR phone,name)</label>
-  <input type="file" id="csvFile" accept=".csv">
+  <label>CSV (phone[,message] or single 'phone' column). You can paste CSV text or upload file.</label>
+  <textarea id="csv" rows="8" placeholder="phone&#10;+14165551234&#10;+18339186267"></textarea>
+  <input type="file" id="csvfile" accept=".csv" />
 
-  <label>Or paste CSV content</label>
-  <textarea id="csvText" rows="6" placeholder="phone,name,message"></textarea>
+  <label>Message template (use {{name}} etc if CSV has columns). Include opt-out: Reply STOP</label>
+  <textarea id="template" rows="3" placeholder="Big sale! Reply STOP to unsubscribe."></textarea>
 
-  <label>Or enter a template (use {{name}}). If left blank, per-row message column must exist.</label>
-  <textarea id="template" rows="3" placeholder="Hi {{name}}, your code is 1234"></textarea>
-
-  <div style="display:flex;gap:12px;margin-top:8px">
-    <button id="estimateBtn">Estimate & Preview</button>
-    <button id="sendBtn" style="background:#059669">Reserve & Send</button>
+  <div class="row">
+    <button id="estimateBtn">Estimate</button>
+    <button id="sendBtn" disabled>Send</button>
+    <span id="estInfo" class="muted"></span>
   </div>
 
-  <h3>Preview</h3>
-  <div id="preview"></div>
-
-  <h3>Wallet</h3>
-  <div id="walletArea">
-    <button id="refreshWallet">Refresh</button>
-    <div id="walletInfo"></div>
-    <div class="small">To top up: call admin endpoint with header <code>X-ADMIN-TOKEN</code>. Amount must be in mills (1 mill = $0.001). Example: top-up 100000 mills = $100.000</div>
+  <div id="analytics">
+    <h3>Campaign Analytics</h3>
+    <div>Total recipients: <span id="totalCount">0</span></div>
+    <div>Sent: <span id="sentCount">0</span></div>
+    <div>Failed: <span id="failedCount">0</span></div>
+    <div>Queued / Sending: <span id="queuedCount">0</span></div>
+    <div class="bar"><div id="sentBar" class="bar-inner"></div><div id="failBar" class="fail-inner"></div></div>
+    <div class="muted" id="jobIdDisplay"></div>
   </div>
 
   <script>
-    const PRICE_PER_SMS_USD = 0.023; // display only
-    const PRICE_PER_SMS_MILLS = 23; // server-side uses mills
+    const estimateBtn = document.getElementById('estimateBtn');
+    const sendBtn = document.getElementById('sendBtn');
+    const csvEl = document.getElementById('csv');
+    const csvFileEl = document.getElementById('csvfile');
+    const templateEl = document.getElementById('template');
+    const estInfo = document.getElementById('estInfo');
+    const analytics = document.getElementById('analytics');
+    const totalCount = document.getElementById('totalCount');
+    const sentCount = document.getElementById('sentCount');
+    const failedCount = document.getElementById('failedCount');
+    const queuedCount = document.getElementById('queuedCount');
+    const sentBar = document.getElementById('sentBar');
+    const failBar = document.getElementById('failBar');
+    const jobIdDisplay = document.getElementById('jobIdDisplay');
 
-    async function toText(file){
-      if(!file) return '';
-      return await file.text();
-    }
+    let lastEstimate = null;
+    let currentJobId = null;
+    let pollInterval = null;
 
-    async function parseCsvServer(csvText, template, defaultCountry, send){
-      const res = await fetch('/api/estimate', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ csv: csvText, template, defaultCountry, send })
-      });
-      return await res.json();
-    }
+    csvFileEl.addEventListener('change', (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      const reader = new FileReader();
+      reader.onload = () => csvEl.value = reader.result;
+      reader.readAsText(f);
+    });
 
-    function renderPreview(rows, totals, rejected){
-      const container = document.getElementById('preview');
-      if(!rows || rows.length===0){ container.innerHTML = '<div class="small">No rows parsed yet.</div>'; return; }
-      let html = `<div class="muted">Rows parsed: ${rows.length} — Estimated segments: ${totals.segments} — Estimated cost: ${totals.cost_usd} USD</div>`;
-      if(rejected && rejected.length>0){
-        html += `<div style="color:#b91c1c;margin-top:8px"><strong>Rejected rows:</strong> ${rejected.length}. Check CSV and ensure numbers are Canadian (+1 country code or valid Canada format).</div>`;
+    estimateBtn.onclick = async () => {
+      estInfo.textContent = 'Estimating...';
+      sendBtn.disabled = true;
+      try {
+        const resp = await fetch('/api/estimate', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({csv: csvEl.value, template: templateEl.value, defaultCountry: 'CA', send: false})
+        });
+        const j = await resp.json();
+        if (j.error) {
+          estInfo.textContent = 'Error: ' + j.error;
+          return;
+        }
+        lastEstimate = j;
+        estInfo.textContent = `Segments: ${j.totalSegments} — Cost: ${j.totalCost_usd} — Rows: ${j.rows.length} — Rejected: ${j.rejected.length}`;
+        sendBtn.disabled = false;
+      } catch (err) {
+        estInfo.textContent = 'Estimate failed: ' + err;
       }
-      html += '<table><thead><tr><th>#</th><th>phone</th><th>message</th><th>segments</th></tr></thead><tbody>';
-      for(let i=0;i<Math.min(rows.length,20);i++){
-        html += `<tr><td>${i+1}</td><td>${rows[i].phone||''}</td><td>${rows[i].message||''}</td><td>${rows[i].segments||''}</td></tr>`;
-      }
-      html += '</tbody></table>';
-      container.innerHTML = html;
-    }
-
-    document.getElementById('estimateBtn').onclick = async () => {
-      const fileEl = document.getElementById('csvFile');
-      const file = fileEl.files[0];
-      let text = document.getElementById('csvText').value;
-      if(file && !text) text = await toText(file);
-      if(!text){ alert('Provide CSV'); return; }
-      const template = document.getElementById('template').value;
-      const defaultCountry = 'CA';
-      const j = await parseCsvServer(text, template, defaultCountry, false);
-      if(j.error) return alert(j.error);
-      const totals = { segments: j.totalSegments, cost_usd: j.totalCost_usd };
-      renderPreview(j.rows, totals, j.rejected || []);
     };
 
-    document.getElementById('sendBtn').onclick = async () => {
-      const fileEl = document.getElementById('csvFile');
-      const file = fileEl.files[0];
-      let text = document.getElementById('csvText').value;
-      if(file && !text) text = await toText(file);
-      if(!text){ alert('Provide CSV'); return; }
-      const template = document.getElementById('template').value;
-      const defaultCountry = 'CA';
-      const j = await parseCsvServer(text, template, defaultCountry, true);
-      if(j.error) return alert(j.error);
-      const totals = { segments: j.totalSegments, cost_usd: j.totalCost_usd };
-      renderPreview(j.rows, totals, j.rejected || []);
-      alert('Job queued! Job id: ' + j.jobId + '\nEstimated cost: ' + j.totalCost_usd + ' USD');
+    sendBtn.onclick = async () => {
+      if (!lastEstimate) { alert('Estimate first'); return; }
+      if (!confirm('Send now? This will charge your wallet.')) return;
+      estInfo.textContent = 'Sending...';
+      try {
+        const resp = await fetch('/api/estimate', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({csv: csvEl.value, template: templateEl.value, defaultCountry: 'CA', send: true})
+        });
+        const j = await resp.json();
+        if (j.error) {
+          estInfo.textContent = 'Send error: ' + j.error;
+          return;
+        }
+        currentJobId = j.jobId;
+        jobIdDisplay.textContent = 'Job: ' + currentJobId;
+        analytics.style.display = 'block';
+        // initialize analytics
+        totalCount.textContent = j.rows ? j.rows.length : (j.totalRecipients || 0);
+        sentCount.textContent = 0;
+        failedCount.textContent = 0;
+        queuedCount.textContent = totalCount.textContent;
+        updateBars();
+        // start polling
+        startPolling(currentJobId);
+      } catch (err) {
+        estInfo.textContent = 'Send failed: ' + err;
+      }
     };
 
-    async function refreshWallet(){
-      const r = await fetch('/api/wallet');
-      const j = await r.json();
-      document.getElementById('walletInfo').innerHTML = `<div>Balance: <strong>${j.balance_usd} USD</strong> (${j.balance_mills} mills)</div>`;
+    function updateBars(){
+      const total = parseInt(totalCount.textContent) || 0;
+      const sent = parseInt(sentCount.textContent) || 0;
+      const failed = parseInt(failedCount.textContent) || 0;
+      const pctSent = total ? Math.round((sent/total)*100) : 0;
+      const pctFailed = total ? Math.round((failed/total)*100) : 0;
+      sentBar.style.width = pctSent + '%';
+      failBar.style.width = pctFailed + '%';
     }
-    document.getElementById('refreshWallet').onclick = refreshWallet;
-    refreshWallet();
+
+    async function pollJob(jobId){
+      try {
+        const resp = await fetch('/api/job/' + jobId);
+        const j = await resp.json();
+        if (j.error) return;
+        const recs = j.recipients || [];
+        let sent=0, failed=0, queued=0;
+        for (const r of recs){
+          if (r.status === 'sent' || r.status === 'delivered') sent++;
+          else if (r.status === 'failed') failed++;
+          else if (r.status === 'queued' || r.status === 'sending') queued++;
+        }
+        totalCount.textContent = recs.length;
+        sentCount.textContent = sent;
+        failedCount.textContent = failed;
+        queuedCount.textContent = queued;
+        updateBars();
+        // stop polling when job completed
+        if (j.job && j.job.status === 'completed') {
+          if (pollInterval) clearInterval(pollInterval);
+          pollInterval = null;
+        }
+      } catch (err) {
+        console.error('pollJob err', err);
+      }
+    }
+
+    function startPolling(jobId){
+      if (pollInterval) clearInterval(pollInterval);
+      pollJob(jobId); // immediate
+      pollInterval = setInterval(()=> pollJob(jobId), 2000); // every 2s
+    }
   </script>
 </body>
 </html>
