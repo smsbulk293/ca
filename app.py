@@ -352,7 +352,7 @@ def api_estimate():
     if not csv_text:
         return jsonify(error='CSV missing'), 400
 
-        try:
+    try:
         reader = csv.DictReader(csv_text.splitlines())
         rows = [r for r in reader if any((v or '').strip() for v in r.values())]
     except Exception as e:
@@ -386,8 +386,6 @@ def api_estimate():
         seg = segments_for_text(message)
         total_segments += seg
         parsed.append({'phone': phone, 'message': message, 'segments': seg, 'original': r})
-
-
 
     total_cost_mills = total_segments * PRICE_PER_SMS_MILLS
 
@@ -441,6 +439,7 @@ def api_estimate():
 
     return jsonify(ok=True, jobId=job_id, totalCost_mills=total_cost_mills,
                    totalCost_usd=mills_to_usd_string(total_cost_mills), rejected=rejected)
+
 
 @app.route('/api/wallet', methods=['GET'])
 def api_wallet():
