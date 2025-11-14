@@ -6,24 +6,27 @@
   <style>
     body { font-family: Arial, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; }
     textarea, input[type=file], input[type=text] { width:100%; box-sizing:border-box; padding:8px; margin:6px 0; }
-    button { padding:10px 14px; margin:6px 4px; }
+    button { padding:10px 14px; margin:6px 4px; cursor:pointer; }
     #analytics { border:1px solid #ddd; padding:12px; border-radius:6px; margin-top:12px; display:none; }
-    .bar { height:18px; background:#eee; border-radius:9px; overflow:hidden; margin-top:8px; }
+    .bar { height:18px; background:#eee; border-radius:9px; overflow:hidden; margin-top:8px; position:relative; }
     .bar-inner { height:100%; background:#4caf50; width:0%; transition: width 0.5s ease; }
-    .fail-inner { height:100%; background:#f44336; width:0%; transition: width 0.5s ease; position:relative; left:0; }
-    .row { display:flex; gap:12px; align-items:center; margin-top:6px; }
+    .fail-inner { height:100%; background:#f44336; width:0%; transition: width 0.5s ease; position:absolute; left:0; top:0; }
+    .row { display:flex; gap:12px; align-items:center; margin-top:6px; flex-wrap:wrap; }
     .muted { color:#666; font-size:13px; }
   </style>
 </head>
 <body>
-  <h1>Bulk SMS — Simple</h1>
-  <div id="wallet" style="border:1px solid #eee;padding:10px;border-radius:6px;margin-bottom:12px;">
-  Wallet balance: <strong id="walletUsd">loading...</strong> (<span id="walletMills">--</span> mills)
-</div>
 
+  <h1>Bulk SMS — Simple</h1>
+
+  <!-- WALLET PANEL -->
+  <div id="wallet" style="border:1px solid #eee;padding:10px;border-radius:6px;margin-bottom:12px;">
+    Wallet balance: <strong id="walletUsd">loading...</strong> 
+    (<span id="walletMills">--</span> mills)
+  </div>
 
   <label>CSV (phone[,message] or single 'phone' column). You can paste CSV text or upload file.</label>
-  <textarea id="csv" rows="8" placeholder="phone&#10;+14165551234&#10;+18339186267"></textarea>
+  <textarea id="csv" rows="8" placeholder="phone&#10;+14165551234&#10;4165551234&#10;16475551234"></textarea>
   <input type="file" id="csvfile" accept=".csv" />
 
   <label>Message template (use {{name}} etc if CSV has columns). Include opt-out: Reply STOP</label>
@@ -35,17 +38,23 @@
     <span id="estInfo" class="muted"></span>
   </div>
 
+  <!-- ANALYTICS PANEL -->
   <div id="analytics">
     <h3>Campaign Analytics</h3>
     <div>Total recipients: <span id="totalCount">0</span></div>
     <div>Sent: <span id="sentCount">0</span></div>
     <div>Failed: <span id="failedCount">0</span></div>
     <div>Queued / Sending: <span id="queuedCount">0</span></div>
-    <div class="bar"><div id="sentBar" class="bar-inner"></div><div id="failBar" class="fail-inner"></div></div>
+
+    <div class="bar">
+      <div id="sentBar" class="bar-inner"></div>
+      <div id="failBar" class="fail-inner"></div>
+    </div>
     <div class="muted" id="jobIdDisplay"></div>
   </div>
 
   <script>
+    // --- DOM references ---
     const estimateBtn = document.getElementById('estimateBtn');
     const sendBtn = document.getElementById('sendBtn');
     const csvEl = document.getElementById('csv');
@@ -60,33 +69,42 @@
     const sentBar = document.getElementById('sentBar');
     const failBar = document.getElementById('failBar');
     const jobIdDisplay = document.getElementById('jobIdDisplay');
-    // --- Wallet helpers ---
-const walletUsdEl = document.getElementById('walletUsd');
-const walletMillsEl = document.getElementById('walletMills');
 
-async function fetchWallet() {
-  try {
-    const resp = await fetch('/api/wallet');
-    const j = await resp.json();
-    if (j && typeof j.balance_mills !== 'undefined') {
-      walletMillsEl.textContent = j.balance_mills;
-      walletUsdEl.textContent = j.balance_usd || ( (j.balance_mills/1000).toFixed(3) );
-    } else {
-      walletMillsEl.textContent = '--';
-      walletUsdEl.textContent = 'error';
+    // Wallet DOM refs
+    const walletUsdEl = document.getElementById('walletUsd');
+    const walletMillsEl = document.getElementById('walletMills');
+
+    // --- Wallet format helper ---
+    function formatUsdFromMills(mills) {
+      const dollars = Number(mills) / 1000;
+      return dollars.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     }
-  } catch (err) {
-    walletMillsEl.textContent = '--';
-    walletUsdEl.textContent = 'error';
-    console.error('fetchWallet error', err);
-  }
-}
 
+    // --- Fetch wallet from backend ---
+    async function fetchWallet() {
+      try {
+        const resp = await fetch('/api/wallet');
+        const j = await resp.json();
+
+        if (j && typeof j.balance_mills !== 'undefined') {
+          walletMillsEl.textContent = j.balance_mills;
+          walletUsdEl.textContent = j.balance_usd || ('$' + formatUsdFromMills(j.balance_mills));
+        } else {
+          walletMillsEl.textContent = '--';
+          walletUsdEl.textContent = 'error';
+        }
+      } catch (err) {
+        walletMillsEl.textContent = '--';
+        walletUsdEl.textContent = 'error';
+        console.error('fetchWallet error', err);
+      }
+    }
 
     let lastEstimate = null;
     let currentJobId = null;
     let pollInterval = null;
 
+    // Load CSV file into textarea
     csvFileEl.addEventListener('change', (e) => {
       const f = e.target.files[0];
       if (!f) return;
@@ -95,106 +113,155 @@ async function fetchWallet() {
       reader.readAsText(f);
     });
 
+    // --- Estimate handler ---
     estimateBtn.onclick = async () => {
       estInfo.textContent = 'Estimating...';
       sendBtn.disabled = true;
+
       try {
         const resp = await fetch('/api/estimate', {
           method: 'POST',
           headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({csv: csvEl.value, template: templateEl.value, defaultCountry: 'CA', send: false})
+          body: JSON.stringify({
+            csv: csvEl.value,
+            template: templateEl.value,
+            defaultCountry: 'CA',
+            send: false
+          })
         });
+
         const j = await resp.json();
+
         if (j.error) {
           estInfo.textContent = 'Error: ' + j.error;
           return;
         }
+
         lastEstimate = j;
-        estInfo.textContent = `Segments: ${j.totalSegments} — Cost: ${j.totalCost_usd} — Rows: ${j.rows.length} — Rejected: ${j.rejected.length}`;
+        estInfo.textContent =
+          `Segments: ${j.totalSegments} — Cost: ${j.totalCost_usd} — ` +
+          `Rows: ${j.rows.length} — Rejected: ${j.rejected.length}`;
+
         sendBtn.disabled = false;
+
       } catch (err) {
         estInfo.textContent = 'Estimate failed: ' + err;
       }
     };
 
+    // --- Send handler ---
     sendBtn.onclick = async () => {
-      if (!lastEstimate) { alert('Estimate first'); return; }
+      if (!lastEstimate) {
+        alert('Estimate first');
+        return;
+      }
+
       if (!confirm('Send now? This will charge your wallet.')) return;
+
       estInfo.textContent = 'Sending...';
+
       try {
         const resp = await fetch('/api/estimate', {
           method: 'POST',
           headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({csv: csvEl.value, template: templateEl.value, defaultCountry: 'CA', send: true})
+          body: JSON.stringify({
+            csv: csvEl.value,
+            template: templateEl.value,
+            defaultCountry: 'CA',
+            send: true
+          })
         });
+
         const j = await resp.json();
         if (j.error) {
           estInfo.textContent = 'Send error: ' + j.error;
           return;
         }
+
         currentJobId = j.jobId;
         jobIdDisplay.textContent = 'Job: ' + currentJobId;
         analytics.style.display = 'block';
+
+        // Refresh wallet after cost is reserved
         fetchWallet();
 
-        // initialize analytics
+        // Analytics init
         totalCount.textContent = j.rows ? j.rows.length : (j.totalRecipients || 0);
         sentCount.textContent = 0;
         failedCount.textContent = 0;
         queuedCount.textContent = totalCount.textContent;
         updateBars();
-        // start polling
+
+        // Start polling job + wallet updates
         startPolling(currentJobId);
+
       } catch (err) {
         estInfo.textContent = 'Send failed: ' + err;
       }
     };
 
-    function updateBars(){
-      const total = parseInt(totalCount.textContent) || 0;
-      const sent = parseInt(sentCount.textContent) || 0;
-      const failed = parseInt(failedCount.textContent) || 0;
-      const pctSent = total ? Math.round((sent/total)*100) : 0;
-      const pctFailed = total ? Math.round((failed/total)*100) : 0;
+    function updateBars() {
+      const total = Number(totalCount.textContent) || 0;
+      const sent = Number(sentCount.textContent) || 0;
+      const failed = Number(failedCount.textContent) || 0;
+
+      const pctSent = total ? Math.round((sent / total) * 100) : 0;
+      const pctFailed = total ? Math.round((failed / total) * 100) : 0;
+
       sentBar.style.width = pctSent + '%';
       failBar.style.width = pctFailed + '%';
     }
 
-    async function pollJob(jobId){
+    // Poll backend for job progress
+    async function pollJob(jobId) {
       try {
         const resp = await fetch('/api/job/' + jobId);
         const j = await resp.json();
         if (j.error) return;
+
         const recs = j.recipients || [];
-        let sent=0, failed=0, queued=0;
-        for (const r of recs){
+
+        let sent = 0, failed = 0, queued = 0;
+        for (const r of recs) {
           if (r.status === 'sent' || r.status === 'delivered') sent++;
           else if (r.status === 'failed') failed++;
           else if (r.status === 'queued' || r.status === 'sending') queued++;
         }
+
         totalCount.textContent = recs.length;
         sentCount.textContent = sent;
         failedCount.textContent = failed;
         queuedCount.textContent = queued;
+
         updateBars();
-        // stop polling when job completed
+
+        // Stop polling when job done
         if (j.job && j.job.status === 'completed') {
-          if (pollInterval) clearInterval(pollInterval);
+          clearInterval(pollInterval);
           pollInterval = null;
         }
+
       } catch (err) {
-        console.error('pollJob err', err);
+        console.error('pollJob error', err);
       }
     }
 
-    function startPolling(jobId){
+    // Poll job + wallet every 2 seconds
+    function startPolling(jobId) {
       if (pollInterval) clearInterval(pollInterval);
-      pollJob(jobId); // immediate
-      pollInterval = setInterval(()=> pollJob(jobId), 2000); // every 2s
-    }
-    // initial load
-fetchWallet();
 
+      pollJob(jobId);
+      fetchWallet();
+
+      pollInterval = setInterval(() => {
+        pollJob(jobId);
+        fetchWallet();
+      }, 2000);
+    }
+
+    // Initial wallet load
+    fetchWallet();
   </script>
+
 </body>
 </html>
