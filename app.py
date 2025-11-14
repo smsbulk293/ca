@@ -11,6 +11,8 @@ from twilio.rest import Client
 import phonenumbers
 from threading import Lock
 import base64
+from twilio.base.exceptions import TwilioRestException
+
 
 # optional google sheets support
 try:
@@ -209,11 +211,11 @@ def mills_to_usd_string(mills: int) -> str:
 # -----------------------
 def process_job(job_id):
     """
-    Background thread worker for a single job. Ensures:
-      - Only one thread per job runs (uses running_jobs set)
-      - Marks recipient as 'sending' inside fs_lock before actual send
-      - Throttles sends using SEND_DELAY_MS (e.g., 500 ms for 2 msg/sec)
-      - Refunds unused mills at the end
+    Robust worker:
+      - ensures single thread per job via running_jobs set
+      - marks recipient 'sending' inside fs_lock to avoid duplicates
+      - retries transient errors with exponential backoff, handles rate limit 429
+      - throttles with SEND_DELAY_MS between sends (ms)
     """
     if job_id in running_jobs:
         print(f"[worker-thread] job {job_id} already running, skipping start")
@@ -227,7 +229,6 @@ def process_job(job_id):
         while True:
             with fs_lock:
                 recips_all = read_json(RECIPS_PATH)
-                # fetch next queued recipient for this job (FIFO)
                 next_rec = next((r for r in recips_all if r.get('jobId') == job_id and r.get('status') == 'queued'), None)
                 if not next_rec:
                     break
@@ -239,16 +240,16 @@ def process_job(job_id):
                         r['lastAttemptAt'] = datetime.utcnow().isoformat() + 'Z'
                         write_json_atomic(RECIPS_PATH, recips_all)
                         break
-                # copy values for send outside the lock
                 rec_id = next_rec.get('id')
                 phone = next_rec.get('phone')
                 msg_text = next_rec.get('message')
                 segs = next_rec.get('segments', 1)
 
-            # perform send with immediate retries
+            # perform send with smarter retry strategy
             success = False
             last_err = None
-            for attempt in range(MAX_IMMEDIATE_RETRIES):
+            backoff_base = 1.0
+            for attempt in range(MAX_IMMEDIATE_RETRIES + 3):  # allow a couple more attempts for transient 429/5xx
                 try:
                     if not tw_client:
                         raise RuntimeError('Twilio not configured')
@@ -272,6 +273,18 @@ def process_job(job_id):
                     break
                 except Exception as e:
                     last_err = str(e)
+                    # If TwilioRestException, inspect status code for 429 / 5xx
+                    if isinstance(e, TwilioRestException):
+                        status_code = getattr(e, 'status', None)
+                        # Rate limit or server error → exponential backoff and retry
+                        if status_code == 429 or (status_code is not None and 500 <= status_code < 600):
+                            wait = backoff_base * (2 ** attempt)
+                            # cap wait to 30s
+                            wait = min(wait, 30)
+                            print(f"[worker-thread] Twilio transient (status={status_code}), retrying after {wait:.1f}s (attempt {attempt+1})")
+                            time.sleep(wait)
+                            continue
+                    # For other exceptions: small jittered wait then retry immediate attempts
                     time.sleep(0.5 + attempt * 0.5)
                     continue
 
@@ -285,7 +298,7 @@ def process_job(job_id):
                         write_json_atomic(RECIPS_PATH, recips_all)
                 failed_segments += segs
 
-            # throttle between sends
+            # throttle between sends (ensure at least SEND_DELAY_MS)
             time.sleep(SEND_DELAY_MS / 1000.0)
 
         # finalize job
@@ -300,7 +313,6 @@ def process_job(job_id):
                     wallet = read_json(WALLET_PATH)
                     wallet['balance_mills'] = wallet.get('balance_mills', 0) + refund_mills
                     write_json_atomic(WALLET_PATH, wallet)
-                    # sync to Google Sheet if enabled
                     try:
                         write_wallet_to_sheet(wallet['balance_mills'])
                     except Exception:
@@ -315,6 +327,7 @@ def process_job(job_id):
         print(f"[worker-thread] Completed job {job_id}: sent={sent_segments} failed={failed_segments}")
     finally:
         running_jobs.discard(job_id)
+
 
 
 def start_background_worker_for(job_id):
