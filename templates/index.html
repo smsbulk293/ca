@@ -17,6 +17,10 @@
 </head>
 <body>
   <h1>Bulk SMS — Simple</h1>
+  <div id="wallet" style="border:1px solid #eee;padding:10px;border-radius:6px;margin-bottom:12px;">
+  Wallet balance: <strong id="walletUsd">loading...</strong> (<span id="walletMills">--</span> mills)
+</div>
+
 
   <label>CSV (phone[,message] or single 'phone' column). You can paste CSV text or upload file.</label>
   <textarea id="csv" rows="8" placeholder="phone&#10;+14165551234&#10;+18339186267"></textarea>
@@ -56,6 +60,28 @@
     const sentBar = document.getElementById('sentBar');
     const failBar = document.getElementById('failBar');
     const jobIdDisplay = document.getElementById('jobIdDisplay');
+    // --- Wallet helpers ---
+const walletUsdEl = document.getElementById('walletUsd');
+const walletMillsEl = document.getElementById('walletMills');
+
+async function fetchWallet() {
+  try {
+    const resp = await fetch('/api/wallet');
+    const j = await resp.json();
+    if (j && typeof j.balance_mills !== 'undefined') {
+      walletMillsEl.textContent = j.balance_mills;
+      walletUsdEl.textContent = j.balance_usd || ( (j.balance_mills/1000).toFixed(3) );
+    } else {
+      walletMillsEl.textContent = '--';
+      walletUsdEl.textContent = 'error';
+    }
+  } catch (err) {
+    walletMillsEl.textContent = '--';
+    walletUsdEl.textContent = 'error';
+    console.error('fetchWallet error', err);
+  }
+}
+
 
     let lastEstimate = null;
     let currentJobId = null;
@@ -109,6 +135,8 @@
         currentJobId = j.jobId;
         jobIdDisplay.textContent = 'Job: ' + currentJobId;
         analytics.style.display = 'block';
+        fetchWallet();
+
         // initialize analytics
         totalCount.textContent = j.rows ? j.rows.length : (j.totalRecipients || 0);
         sentCount.textContent = 0;
@@ -164,6 +192,9 @@
       pollJob(jobId); // immediate
       pollInterval = setInterval(()=> pollJob(jobId), 2000); // every 2s
     }
+    // initial load
+fetchWallet();
+
   </script>
 </body>
 </html>
